@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 numpy
 pandas
+python-multipart
+scipy
+httpx
