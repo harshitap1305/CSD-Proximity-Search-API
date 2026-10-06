@@ -1,98 +1,112 @@
-import importlib, math, os, random, tempfile, time
+import functools, http.server, importlib, io, math, os, random, tempfile, threading, time
 import numpy as np, pandas as pd
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 from fastapi.testclient import TestClient
 
-df = pd.read_csv("locations.csv"); N = len(df); S = 100
-rows = list(df.itertuples(index=False)); cats = sorted(df.Category.unique())
-ULAT = sorted(df.Latitude.unique()); ULON = sorted(df.Longitude.unique())
-STEP = float(np.median(np.diff(ULAT)))
-R = lambda x: round(x, 9)
+HERE = os.path.dirname(os.path.abspath(__file__))
+df = pd.read_csv(os.path.join(HERE, "locations.csv")); N = len(df); S = 100
+LAT, LON, CAT, ID = df.Latitude.values, df.Longitude.values, df.Category.values, df.ID.values
+cats = sorted(set(CAT)); R = lambda x: round(float(x), 9)
 
-def ref_plain(q, cat, rad, snap, hops):               
-    a, o = (min(ULAT, key=lambda u: abs(u-q[0])), min(ULON, key=lambda u: abs(u-q[1]))) if snap else q
-    out = []
-    for r in rows:
-        e = math.hypot(r.Latitude-q[0], r.Longitude-q[1])
-        if r.Category == cat and R(e) <= R(rad):
-            d = abs(r.Latitude-a) + abs(r.Longitude-o)
-            out.append((float(round(d/STEP)) if hops else R(d), R(e), r.ID))
-    return [x[2] for x in sorted(out)[:10]]
-
-def ref_graph(q, cat, rad, hops, blocked=()):           
-    bad = {frozenset(b) for b in blocked}; u, v, w = [], [], []
+def make_links(p_missing, seed):
+    rng = random.Random(seed); lines = []
     for i in range(S):
         for j in range(S):
-            k = i*S+j
-            for a, b in ((i+1, j), (i, j+1)):
-                if a < S and b < S:
-                    m = a*S+b
-                    if frozenset((k+1, m+1)) in bad: continue
-                    h = 1.0 if hops else abs(df.Latitude[k]-df.Latitude[m]) + abs(df.Longitude[k]-df.Longitude[m])
-                    u += [k, m]; v += [m, k]; w += [h, h]
+            k = i * S + j + 1
+            if j + 1 < S and rng.random() >= p_missing: lines.append(f"{k} {k+1}")
+            if i + 1 < S and rng.random() >= p_missing: lines.append(f"{k} {k+S}")
+    rng.shuffle(lines)
+    return "\n".join(lines) + "\n"
+
+def ref(text, q, cat, rad, hops):
+    e = [tuple(map(int, l.replace(",", " ").split()[:2])) for l in text.splitlines()
+         if len(l.split()) >= 2 and l.strip()[0] not in "#%"]
+    e = [(a - 1, b - 1) for a, b in e if 1 <= a <= N and 1 <= b <= N and a != b]
+    u = [a for a, b in e] + [b for a, b in e]; v = [b for a, b in e] + [a for a, b in e]
+    w = [1.0 if hops else math.hypot(LAT[a]-LAT[b], LON[a]-LON[b]) for a, b in e] * 2
     G = coo_matrix((w, (u, v)), shape=(N, N)).tocsr()
-    src = min(range(S), key=lambda i: abs(ULAT[i]-q[0]))*S + min(range(S), key=lambda j: abs(ULON[j]-q[1]))
+    src = int(np.argmin((LAT-q[0])**2 + (LON-q[1])**2))
     d = dijkstra(G, indices=src)
-    out = [(R(d[r.ID-1]), R(math.hypot(r.Latitude-q[0], r.Longitude-q[1])), r.ID) for r in rows
-           if r.Category == cat and R(math.hypot(r.Latitude-q[0], r.Longitude-q[1])) <= R(rad)]
+    out = []
+    for k in range(N):
+        eu = math.hypot(LAT[k]-q[0], LON[k]-q[1])
+        if CAT[k] == cat and R(eu) <= R(rad) and np.isfinite(d[k]): out.append((R(d[k]), R(eu), int(ID[k])))
     return [x[2] for x in sorted(out)[:10]]
 
-def load(blocked="/nonexistent", snap="1", mode="coords"):
-    os.environ.update(BLOCKED_EDGES=blocked, SNAP=snap, DIST_MODE=mode)
+def load(mode="coords", **env):
+    os.environ.update(DIST_MODE=mode, LINKS_FILE="/nonexistent", SNAP="1", **env)
     import app; importlib.reload(app); return app
 
-def rand_q(rng, t):
-    if t % 3 == 0: return (rng.random(), rng.random())                                  
-    if t % 3 == 1: k = rng.randrange(N); return (df.Latitude[k], df.Longitude[k])       
-    return (rng.choice([0, 1, .5, -.1, 1.1]), rng.random())                              
-    
-for snap in ("1", "0"):
-    for mode in ("coords", "hops"):
-        A = load(snap=snap, mode=mode); cl = TestClient(A.app); rng = random.Random(1); T = 150
-        for t in range(T):
-            q = rand_q(rng, t); cat = rng.choice(cats); rad = rng.choice([.05, .1, .2, .4, 1.5])
-            got = cl.get("/search/", params=dict(lat=q[0], long=q[1], cat=cat, rad=rad)).json()["ids"]
-            assert got == ref_plain(q, cat, rad, snap == "1", mode == "hops"), (snap, mode, q, cat, rad)
-        print(f"[1] SNAP={snap} DIST_MODE={mode:6s}: {T}/{T} match brute force")
+def queries(n, seed):
+    rng = random.Random(seed)
+    for t in range(n):
+        if t % 2: k = rng.randrange(N); q = (LAT[k], LON[k])        # on a location
+        else:     q = (rng.random(), rng.random())                  # off-grid
+        yield q, rng.choice(cats), rng.choice([.08, .15, .3, .6, 1.5])
+
+TXT = make_links(.15, 1)
+FULL = make_links(0, 2)
 
 for mode in ("coords", "hops"):
-    A = load(mode=mode); rng = random.Random(3)
-    for t in range(12):
-        k = rng.randrange(N); q = (df.Latitude[k], df.Longitude[k]); cat = rng.choice(cats); rad = rng.choice([.1, .3, 1.5])
-        assert A.index.search(*q, cat, rad) == ref_graph(q, cat, rad, mode == "hops"), (mode, q)
-    print(f"[2] {mode:6s}: 12/12 == scipy Dijkstra on full lattice")
-
-rng = random.Random(7); blocked = []
-for i in range(S):
-    for j in range(S):
-        k = i*S+j+1
-        if j+1 < S and rng.random() < .15: blocked.append((k, k+1))
-        if i+1 < S and rng.random() < .15: blocked.append((k, k+S))
-f = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False); pd.DataFrame(blocked, columns=["ID1", "ID2"]).to_csv(f.name, index=False)
-for mode in ("coords", "hops"):
-    A = load(blocked=f.name, mode=mode); good = 0
-    for t in range(20):
-        q = rand_q(rng, t); q = (min(max(q[0], 0), 1), min(max(q[1], 0), 1)); cat = rng.choice(cats); rad = rng.choice([.15, .3, .6])
-        good += A.index.search(*q, cat, rad) == ref_graph(q, cat, rad, mode == "hops", blocked)
-    print(f"[3] blocked roads, {mode:6s}: {good}/20 == scipy Dijkstra"); assert good == 20
+    A = load(mode); cl = TestClient(A.app); ok = 0; T = 60
+    for q, cat, rad in queries(T, 11):
+        r = cl.post("/search/", data=dict(lat=q[0], long=q[1], cat=cat, rad=rad), files={"link": ("links.txt", TXT)})
+        assert r.status_code == 200, r.text
+        assert r.json()["ids"] == ref(TXT, q, cat, rad, mode == "hops"), (mode, q, cat, rad); ok += 1
+    print(f"[1] upload, {mode:6s}, 15% roads missing: {ok}/{T} == scipy Dijkstra")
 
 A = load(); cl = TestClient(A.app)
-assert cl.get("/search/", params=dict(lat=.5, long=.5, cat="zzz", rad=.1)).status_code == 400
-assert cl.get("/search/", params=dict(lat=.5, long=.5)).status_code == 422
-assert cl.post("/search/", json=dict(lat=.5, long=.5, cat="BANK", rad=.1)).json() == cl.get("/search/", params=dict(lat=.5, long=.5, cat="bank", rad=.1)).json()
-ids = cl.get("/search/", params=dict(lat=.2, long=.9, cat="bank", rad=.15)).json()["ids"]
-assert len(ids) == len(set(ids)) and all(df.Category[i-1] == "bank" for i in ids)
-assert all(math.hypot(df.Latitude[i-1]-.2, df.Longitude[i-1]-.9) <= .15+1e-9 for i in ids)
-print("[4] validation, POST==GET, category + radius constraints, no duplicates: OK")
+open(os.path.join(HERE, "_links_test.txt"), "w").write(TXT)
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=HERE))
+threading.Thread(target=srv.serve_forever, daemon=True).start(); url = f"http://127.0.0.1:{srv.server_port}/_links_test.txt"
+q, cat, rad = (0.3, 0.7), "park", 0.25; base = dict(lat=q[0], long=q[1], cat=cat, rad=rad); exp = ref(TXT, q, cat, rad, False)
+pairs = [[int(x) for x in l.split()] for l in TXT.splitlines()]
+tries = {
+ "POST multipart file":   cl.post("/search/", data=base, files={"link": ("l.txt", TXT)}),
+ "GET  multipart file":   cl.request("GET", "/search/", data=base, files={"link": ("l.txt", TXT)}),
+ "POST form text":        cl.post("/search/", data={**base, "link": TXT}),
+ "POST JSON text":        cl.post("/search/", json={**base, "link": TXT}),
+ "POST JSON pair list":   cl.post("/search/", json={**base, "link": pairs}),
+ "GET  query = URL":      cl.get("/search/", params={**base, "link": url}),
+ "GET  query = filename": cl.get("/search/", params={**base, "link": "_links_test.txt"}),
+}
+for name, r in tries.items():
+    assert r.status_code == 200 and r.json()["ids"] == exp, (name, r.status_code, r.text)
+    print(f"[2] {name:22s} OK")
+os.remove(os.path.join(HERE, "_links_test.txt")); srv.shutdown()
 
-rng = random.Random(0); t0 = time.perf_counter()
-for _ in range(300): A.index.search(rng.random(), rng.random(), "cafe", .3)
-print(f"[5] 10k points: {(time.perf_counter()-t0)/300*1000:.2f} ms/query")
-big = pd.DataFrame({"ID": np.arange(1, 10**6+1), "Latitude": np.random.default_rng(0).random(10**6),
-                    "Longitude": np.random.default_rng(1).random(10**6), "Category": np.random.default_rng(2).choice(cats, 10**6)})
-big.to_csv("/tmp/big.csv", index=False); B = A.Index("/tmp/big.csv")
-for r_ in (.05, 1.5):
-    t0 = time.perf_counter(); [B.search(rng.random(), rng.random(), "cafe", r_) for _ in range(20)]
-    print(f"    1M points, rad={r_}: {(time.perf_counter()-t0)/20*1000:.1f} ms/query")
+# 3. messy link file ----------------------------------------------------------
+messy = "# comment\r\n\r\n" + TXT.replace("\n", "\r\n") + "5 5\n999999 3\n1,2\n  2   1  \n3 abc\nfoo\n"
+for q, cat, rad in queries(15, 21):
+    r = cl.post("/search/", data=dict(lat=q[0], long=q[1], cat=cat, rad=rad), files={"link": ("l.txt", messy)})
+    assert r.json()["ids"] == ref(TXT, q, cat, rad, False)
+print("[3] CRLF, comments, blanks, commas, duplicates, self-loops, unknown IDs, junk lines: 15/15 OK")
+
+# 4. sparse / disconnected networks ------------------------------------------
+sparse = make_links(.45, 5); good = 0; n = 0
+for q, cat, rad in queries(30, 31):
+    r = cl.post("/search/", data=dict(lat=q[0], long=q[1], cat=cat, rad=rad), files={"link": ("l.txt", sparse)}).json()["ids"]
+    n += 1; good += (r == ref(sparse, q, cat, rad, False))
+print(f"[4] 45% roads missing (many unreachable nodes): {good}/{n} == scipy Dijkstra"); assert good == n
+
+# 5. complete network == no-link fallback ------------------------------------
+for q, cat, rad in queries(40, 41):
+    p = dict(lat=q[0], long=q[1], cat=cat, rad=rad)
+    a = cl.post("/search/", data=p, files={"link": ("l.txt", FULL)}).json()["ids"]
+    b = cl.post("/search/", data=p).json()["ids"]
+    assert a == b == ref(FULL, q, cat, rad, False), (q, cat, rad, a, b)
+print("[5] full road file == no `link` (Manhattan fallback) == Dijkstra: 40/40")
+
+# 6. errors & contract -------------------------------------------------------
+P = dict(lat=.5, long=.5, cat="bank", rad=.2)
+assert cl.post("/search/", data={**P, "cat": "zzz"}).status_code == 400
+assert cl.post("/search/", data={"lat": .5}).status_code == 422
+assert cl.post("/search/", data={**P, "lat": "x"}).status_code == 422
+assert cl.post("/search/", data={**P, "rad": -1}).status_code == 400
+assert cl.post("/search/", data=P, files={"link": ("l.txt", "garbage\nmore garbage\n")}).status_code == 400
+assert cl.post("/search/", data={**P, "cat": "BANK"}, files={"link": ("l.txt", TXT)}).json() == cl.post("/search/", data=P, files={"link": ("l.txt", TXT)}).json()
+ids = cl.post("/search/", data=P, files={"link": ("l.txt", TXT)}).json()["ids"]
+assert len(ids) == 10 == len(set(ids)) and all(CAT[i-1] == "bank" and math.hypot(LAT[i-1]-.5, LON[i-1]-.5) <= .2 + 1e-9 for i in ids)
+print("[6] error codes, case-insensitive category, 10 unique ids, category+radius constraints: OK")
 print("ALL TESTS PASSED")
