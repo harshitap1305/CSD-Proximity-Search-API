@@ -1,30 +1,44 @@
+import hashlib
 import heapq
 import os
-from collections import defaultdict
+import urllib.request
+from collections import OrderedDict
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
 
 K = 10
-EPS = 9  
-DATA = os.environ.get("LOCATIONS_CSV", os.path.join(os.path.dirname(__file__), "locations.csv"))
+EPS = 9                      # decimals when comparing distances (kills float noise)
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.environ.get("LOCATIONS_CSV", os.path.join(HERE, "locations.csv"))
+DEFAULT_LINKS = os.environ.get("LINKS_FILE", os.path.join(HERE, "links.txt"))
 SNAP = os.environ.get("SNAP", "1") != "0"
 HOPS = os.environ.get("DIST_MODE", "coords").lower() == "hops"
-BLOCKED = os.environ.get("BLOCKED_EDGES", os.path.join(os.path.dirname(__file__), "blocked_edges.csv"))
+
+class Graph:
+    """Undirected road graph in CSR form (python lists -> fast scalar access)."""
+    def __init__(self, indptr, indices, weights, n_edges):
+        self.indptr, self.indices, self.weights, self.n_edges = indptr, indices, weights, n_edges
 
 class Index:
-    def __init__(self, csv_path: str, blocked_path: str | None = None):
+    def __init__(self, csv_path: str):
         df = pd.read_csv(csv_path)
         df.columns = [c.strip() for c in df.columns]
         self.ids = df["ID"].to_numpy(np.int64)
         self.lat = df["Latitude"].to_numpy(np.float64)
         self.lon = df["Longitude"].to_numpy(np.float64)
         self.cat = df["Category"].astype(str).str.strip().str.lower().to_numpy()
+        self.n = self.ids.size
+
+        order = np.argsort(self.ids, kind="stable")          # ID -> row lookup
+        self._sorted_ids, self._sorted_rows = self.ids[order], order
 
         self.ulat, self.ulon = np.unique(self.lat), np.unique(self.lon)
-        pairs = pd.DataFrame({"a": self.lat, "b": self.lon}).duplicated().sum() == 0
-        self.lattice = bool(pairs and self.ulat.size * self.ulon.size == self.ids.size and self.ulat.size > 1)
+        unique_pairs = not pd.DataFrame({"a": self.lat, "b": self.lon}).duplicated().any()
+        self.lattice = bool(unique_pairs and self.ulat.size * self.ulon.size == self.n and self.ulat.size > 1)
         self.step = float(np.median(np.diff(self.ulat))) if self.ulat.size > 1 else 1.0
 
         self.by_cat = {}
@@ -33,113 +47,192 @@ class Index:
             idx = idx[np.argsort(self.lat[idx], kind="stable")]
             self.by_cat[c] = (idx, self.lat[idx])
 
-        self.graph = None
-        if blocked_path and os.path.exists(blocked_path):
-            self._build_graph(blocked_path)
+        self._cache: "OrderedDict[str, Graph]" = OrderedDict()
 
-    def _build_graph(self, blocked_path):
-        ulat, ulon = self.ulat, self.ulon
-        li = np.searchsorted(ulat, self.lat)
-        lj = np.searchsorted(ulon, self.lon)
-        node = {(a, b): k for k, (a, b) in enumerate(zip(li, lj))}   
-        self.node, self.li, self.lj = node, li, lj
-        blocked = pd.read_csv(blocked_path)
-        pos = {int(i): k for k, i in enumerate(self.ids)}
-        bad = {frozenset((pos[int(a)], pos[int(b)])) for a, b in blocked.iloc[:, :2].to_numpy()}
-        adj = defaultdict(list)
-        for (a, b), k in node.items():
-            for da, db in ((1, 0), (0, 1)):
-                m = node.get((a + da, b + db))
-                if m is None or frozenset((k, m)) in bad:
-                    continue
-                w = 1.0 if HOPS else abs(self.lat[k] - self.lat[m]) + abs(self.lon[k] - self.lon[m])
-                adj[k].append((m, w)); adj[m].append((k, w))
-        self.graph = adj
+    def rows_of(self, id_arr):
+        pos = np.searchsorted(self._sorted_ids, id_arr)
+        pos = np.clip(pos, 0, self.n - 1)
+        ok = self._sorted_ids[pos] == id_arr
+        return self._sorted_rows[pos], ok
 
-    def _dijkstra_rank(self, qlat, qlon, targets: dict):
-        a = int(np.abs(self.ulat - qlat).argmin()); b = int(np.abs(self.ulon - qlon).argmin())
-        src = self.node[(a, b)]
-        d0 = abs(self.lat[src] - qlat) + abs(self.lon[src] - qlon)   
-        dist = {src: d0}; pq = [(d0, src)]; done = set(); found = []; cutoff = None
-        while pq:
-            d, u = heapq.heappop(pq)
-            if u in done:
+    def graph_from_text(self, text: str) -> Graph:
+        key = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest() + ("h" if HOPS else "c")
+        g = self._cache.get(key)
+        if g is not None:
+            self._cache.move_to_end(key)
+            return g
+        a, b = [], []
+        for line in text.splitlines():
+            p = line.replace(",", " ").split()
+            if len(p) < 2 or p[0][0] in "#%":
                 continue
-            if cutoff is not None and round(d, EPS) > cutoff:
-                break
-            done.add(u)
-            if u in targets:
-                found.append((round(d, EPS), round(targets[u], EPS), int(self.ids[u])))
-                if len(found) == K:
-                    cutoff = round(d, EPS)      
-            for v, w in self.graph[u]:
-                nd = d + w
-                if nd < dist.get(v, 1e18):
-                    dist[v] = nd; heapq.heappush(pq, (nd, v))
-        return sorted(found)[:K]
+            try:
+                x, y = int(p[0]), int(p[1])
+            except ValueError:
+                try:
+                    x, y = int(float(p[0])), int(float(p[1]))
+                except ValueError:
+                    continue
+            a.append(x); b.append(y)
+        if not a:
+            raise ValueError("link file contains no valid 'a b' lines")
+        ra, oka = self.rows_of(np.asarray(a, np.int64))
+        rb, okb = self.rows_of(np.asarray(b, np.int64))
+        keep = oka & okb & (ra != rb)
+        ra, rb = ra[keep], rb[keep]
+        if ra.size == 0:
+            raise ValueError("none of the links refer to known location IDs")
+        lo, hi = np.minimum(ra, rb), np.maximum(ra, rb)       # undirected, de-duplicated
+        code = np.unique(lo.astype(np.int64) * self.n + hi)
+        lo, hi = code // self.n, code % self.n
+        w = np.ones(lo.size) if HOPS else np.hypot(self.lat[lo] - self.lat[hi], self.lon[lo] - self.lon[hi])
+        src = np.concatenate([lo, hi]); dst = np.concatenate([hi, lo]); ww = np.concatenate([w, w])
+        o = np.argsort(src, kind="stable")
+        indptr = np.concatenate([[0], np.cumsum(np.bincount(src, minlength=self.n))])
+        g = Graph(indptr.tolist(), dst[o].tolist(), ww[o].tolist(), int(lo.size))
+        self._cache[key] = g
+        while len(self._cache) > 3:
+            self._cache.popitem(last=False)
+        return g
 
-    def search(self, qlat, qlon, category, rad):
+    def _candidates(self, qlat, qlon, category, rad):
         entry = self.by_cat.get(category.strip().lower())
         if entry is None:
-            return []
+            return None
         idx, lats = entry
         lo = np.searchsorted(lats, qlat - rad, side="left")
         hi = np.searchsorted(lats, qlat + rad, side="right")
         cand = idx[lo:hi]
         dlat, dlon = self.lat[cand] - qlat, self.lon[cand] - qlon
         euc = np.sqrt(dlat ** 2 + dlon ** 2)
-        inside = round_le(euc, rad)
-        cand, dlat, dlon, euc = cand[inside], dlat[inside], dlon[inside], euc[inside]
-        if cand.size == 0:
+        inside = np.round(euc, EPS) <= round(rad, EPS)
+        return cand[inside], euc[inside]
+
+    def search(self, qlat, qlon, category, rad, graph: Graph | None = None):
+        got = self._candidates(qlat, qlon, category, rad)
+        if got is None or got[0].size == 0:
             return []
-        if self.graph is not None:
-            return [r[2] for r in self._dijkstra_rank(qlat, qlon, dict(zip(cand.tolist(), euc.tolist())))]
-        if SNAP and self.lattice:          
+        cand, euc = got
+        if graph is not None:
+            src = int(np.argmin((self.lat - qlat) ** 2 + (self.lon - qlon) ** 2))   # nearest node
+            return self._dijkstra(graph, src, dict(zip(cand.tolist(), euc.tolist())))
+        if SNAP and self.lattice:
             sa = self.ulat[np.abs(self.ulat - qlat).argmin()]
             so = self.ulon[np.abs(self.ulon - qlon).argmin()]
             man = np.abs(self.lat[cand] - sa) + np.abs(self.lon[cand] - so)
         else:
-            man = np.abs(dlat) + np.abs(dlon)
+            man = np.abs(self.lat[cand] - qlat) + np.abs(self.lon[cand] - qlon)
         man = np.round(man / self.step) if HOPS else np.round(man, EPS)
         order = np.lexsort((self.ids[cand], np.round(euc, EPS), man))[:K]
         return self.ids[cand[order]].tolist()
 
-
-def round_le(euc, rad):
-    return np.round(euc, EPS) <= round(rad, EPS)
-
+    def _dijkstra(self, g: Graph, src: int, targets: dict):
+        """Early-stopping Dijkstra. targets: row -> Euclidean distance from query."""
+        indptr, indices, weights = g.indptr, g.indices, g.weights
+        ids = self.ids
+        dist = {src: 0.0}
+        pq = [(0.0, src)]
+        done = set()
+        found, cutoff, remaining = [], None, len(targets)
+        while pq:
+            d, u = heapq.heappop(pq)
+            if u in done:
+                continue
+            if cutoff is not None and round(d, EPS) > cutoff:
+                break                                  
+            done.add(u)
+            e = targets.get(u)
+            if e is not None:
+                found.append((round(d, EPS), round(e, EPS), int(ids[u])))
+                remaining -= 1
+                if len(found) == K:
+                    cutoff = round(d, EPS)
+                if remaining == 0:
+                    break
+            for k in range(indptr[u], indptr[u + 1]):
+                v = indices[k]
+                nd = d + weights[k]
+                if nd < dist.get(v, 1e300):
+                    dist[v] = nd
+                    heapq.heappush(pq, (nd, v))
+        found.sort()
+        return [f[2] for f in found[:K]]
 
 app = FastAPI(title="Nearest Locations API")
-index = Index(DATA, BLOCKED)
+index = Index(DATA)
 
+def _read_link(value) -> str | None:
+    """Turn whatever was sent as `link` into the text of the road file."""
+    if value is None:
+        return None
+    if isinstance(value, UploadFile):
+        return None   
+    s = str(value)
+    if s.strip() == "":
+        return None
+    t = s.strip()
+    if t.lower().startswith(("http://", "https://")):
+        with urllib.request.urlopen(t, timeout=30) as r:
+            return r.read().decode("utf-8-sig", "replace")
+    if "\n" not in t and len(t) < 260:                    
+        p = os.path.abspath(os.path.join(HERE, t))
+        if p.startswith(HERE + os.sep) and os.path.isfile(p):
+            with open(p, encoding="utf-8-sig", errors="replace") as f:
+                return f.read()
+    return s
 
-class Q(BaseModel):
-    lat: float
-    long: float
-    cat: str
-    rad: float
-
-
-def _run(lat, lon, cat, rad):
+def _solve(params: dict, link_text: str | None):
+    try:
+        lat, lon, rad = float(params["lat"]), float(params["long"]), float(params["rad"])
+        cat = str(params["cat"])
+    except KeyError as e:
+        raise HTTPException(422, f"missing field: {e.args[0]} (need lat, long, cat, rad, link)")
+    except (TypeError, ValueError):
+        raise HTTPException(422, "lat, long and rad must be numbers")
     if rad < 0:
         raise HTTPException(400, "rad must be >= 0")
     if cat.strip().lower() not in index.by_cat:
         raise HTTPException(400, f"unknown category; valid: {sorted(index.by_cat)}")
-    return {"ids": index.search(lat, lon, cat, rad)}
+    if link_text is None and os.path.isfile(DEFAULT_LINKS):
+        with open(DEFAULT_LINKS, encoding="utf-8-sig", errors="replace") as f:
+            link_text = f.read()
+    graph = None
+    if link_text is not None:
+        try:
+            graph = index.graph_from_text(link_text)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    return {"ids": index.search(lat, lon, cat, rad, graph)}
 
-
-@app.get("/search/")
-@app.get("/search", include_in_schema=False)
-def search_get(lat: float = Query(...), long: float = Query(...), cat: str = Query(...), rad: float = Query(...)):
-    return _run(lat, long, cat, rad)
-
-
-@app.post("/search/")
-@app.post("/search", include_in_schema=False)
-def search_post(q: Q):
-    return _run(q.lat, q.long, q.cat, q.rad)
-
+@app.api_route("/search/", methods=["GET", "POST"])
+@app.api_route("/search", methods=["GET", "POST"], include_in_schema=False)
+async def search(request: Request):
+    params = dict(request.query_params)
+    ctype = request.headers.get("content-type", "").lower()
+    if "multipart/form-data" in ctype or "application/x-www-form-urlencoded" in ctype:
+        form = await request.form()
+        for k, v in form.multi_items():
+            params[k] = v
+    elif "application/json" in ctype:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                params.update(body)
+        except Exception:
+            raise HTTPException(400, "invalid JSON body")
+    raw = params.get("link")
+    if isinstance(raw, UploadFile):
+        text = (await raw.read()).decode("utf-8-sig", "replace")
+    elif isinstance(raw, (list, tuple)):                 
+        text = "\n".join(f"{p[0]} {p[1]}" for p in raw)
+    else:
+        try:
+            text = await run_in_threadpool(_read_link, raw)
+        except Exception as e:
+            raise HTTPException(400, f"could not read link: {e}")
+    return JSONResponse(await run_in_threadpool(_solve, params, text))
 
 @app.get("/")
 def root():
-    return {"status": "ok", "usage": "/search/?lat=0.5&long=0.5&cat=bank&rad=0.1", "n": int(index.ids.size)}
+    return {"status": "ok", "n_locations": int(index.n),
+            "usage": "POST /search/ with lat, long, cat, rad and link (road file)"}
