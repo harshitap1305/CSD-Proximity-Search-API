@@ -3,6 +3,7 @@ import heapq
 import os
 import urllib.request
 from collections import OrderedDict
+
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
@@ -41,6 +42,7 @@ class Index:
         self.lattice = bool(unique_pairs and self.ulat.size * self.ulon.size == self.n and self.ulat.size > 1)
         self.step = float(np.median(np.diff(self.ulat))) if self.ulat.size > 1 else 1.0
 
+        # per-category rows sorted by latitude -> bounding band via binary search
         self.by_cat = {}
         for c in np.unique(self.cat):
             idx = np.where(self.cat == c)[0]
@@ -49,6 +51,7 @@ class Index:
 
         self._cache: "OrderedDict[str, Graph]" = OrderedDict()
 
+    # ------------------------------------------------------------------ links
     def rows_of(self, id_arr):
         pos = np.searchsorted(self._sorted_ids, id_arr)
         pos = np.clip(pos, 0, self.n - 1)
@@ -95,6 +98,7 @@ class Index:
             self._cache.popitem(last=False)
         return g
 
+    # ---------------------------------------------------------------- queries
     def _candidates(self, qlat, qlon, category, rad):
         entry = self.by_cat.get(category.strip().lower())
         if entry is None:
@@ -116,6 +120,7 @@ class Index:
         if graph is not None:
             src = int(np.argmin((self.lat - qlat) ** 2 + (self.lon - qlon) ** 2))   # nearest node
             return self._dijkstra(graph, src, dict(zip(cand.tolist(), euc.tolist())))
+        # ---- no link file: complete lattice, grid distance = Manhattan distance
         if SNAP and self.lattice:
             sa = self.ulat[np.abs(self.ulat - qlat).argmin()]
             so = self.ulon[np.abs(self.ulon - qlon).argmin()]
@@ -139,7 +144,7 @@ class Index:
             if u in done:
                 continue
             if cutoff is not None and round(d, EPS) > cutoff:
-                break                                  
+                break                                   # everything tied with the K-th is settled
             done.add(u)
             e = targets.get(u)
             if e is not None:
@@ -166,7 +171,7 @@ def _read_link(value) -> str | None:
     if value is None:
         return None
     if isinstance(value, UploadFile):
-        return None   
+        return None   # handled by caller (async read)
     s = str(value)
     if s.strip() == "":
         return None
@@ -174,7 +179,7 @@ def _read_link(value) -> str | None:
     if t.lower().startswith(("http://", "https://")):
         with urllib.request.urlopen(t, timeout=30) as r:
             return r.read().decode("utf-8-sig", "replace")
-    if "\n" not in t and len(t) < 260:                    
+    if "\n" not in t and len(t) < 260:                     # maybe a file inside the app folder
         p = os.path.abspath(os.path.join(HERE, t))
         if p.startswith(HERE + os.sep) and os.path.isfile(p):
             with open(p, encoding="utf-8-sig", errors="replace") as f:
@@ -204,9 +209,8 @@ def _solve(params: dict, link_text: str | None):
             raise HTTPException(400, str(e))
     return {"ids": index.search(lat, lon, cat, rad, graph)}
 
-@app.api_route("/search/", methods=["GET", "POST"])
-@app.api_route("/search", methods=["GET", "POST"], include_in_schema=False)
-async def search(request: Request):
+
+async def _search(request: Request):
     params = dict(request.query_params)
     ctype = request.headers.get("content-type", "").lower()
     if "multipart/form-data" in ctype or "application/x-www-form-urlencoded" in ctype:
@@ -223,7 +227,7 @@ async def search(request: Request):
     raw = params.get("link")
     if isinstance(raw, UploadFile):
         text = (await raw.read()).decode("utf-8-sig", "replace")
-    elif isinstance(raw, (list, tuple)):                 
+    elif isinstance(raw, (list, tuple)):                    # JSON list of [a, b] pairs
         text = "\n".join(f"{p[0]} {p[1]}" for p in raw)
     else:
         try:
@@ -231,6 +235,47 @@ async def search(request: Request):
         except Exception as e:
             raise HTTPException(400, f"could not read link: {e}")
     return JSONResponse(await run_in_threadpool(_solve, params, text))
+
+
+
+# ---- routes: thin wrappers so that /docs (Swagger) shows real input fields -------------
+_CATS = sorted(index.by_cat)
+_DESC = {
+    "lat": "Current latitude (number)",
+    "long": "Current longitude (number)",
+    "cat": "Category to search for",
+    "rad": "Search radius (circular / Euclidean distance)",
+}
+_POST_DOC = {"requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {
+    "type": "object", "required": ["lat", "long", "cat", "rad"],
+    "properties": {
+        "lat": {"type": "number", "example": 0.5, "description": _DESC["lat"]},
+        "long": {"type": "number", "example": 0.5, "description": _DESC["long"]},
+        "cat": {"type": "string", "enum": _CATS, "description": _DESC["cat"]},
+        "rad": {"type": "number", "example": 0.1, "description": _DESC["rad"]},
+        "link": {"type": "string", "format": "binary",
+                 "description": "Road file (.txt), one 'a b' pair of location IDs per line. Optional."},
+    }}}}}}
+_GET_DOC = {"parameters": [
+    {"name": "lat", "in": "query", "required": True, "schema": {"type": "number", "example": 0.5}, "description": _DESC["lat"]},
+    {"name": "long", "in": "query", "required": True, "schema": {"type": "number", "example": 0.5}, "description": _DESC["long"]},
+    {"name": "cat", "in": "query", "required": True, "schema": {"type": "string", "enum": _CATS}, "description": _DESC["cat"]},
+    {"name": "rad", "in": "query", "required": True, "schema": {"type": "number", "example": 0.1}, "description": _DESC["rad"]},
+    {"name": "link", "in": "query", "required": False, "schema": {"type": "string"},
+     "description": "Optional: URL of the road file, or a file name inside the app folder. (To upload a file, use POST.)"},
+]}
+
+@app.post("/search/", openapi_extra=_POST_DOC, summary="Search (upload the road file here)")
+async def search_post(request: Request):
+    return await _search(request)
+
+@app.get("/search/", openapi_extra=_GET_DOC, summary="Search (no file upload)")
+async def search_get(request: Request):
+    return await _search(request)
+
+@app.api_route("/search", methods=["GET", "POST"], include_in_schema=False)
+async def search_noslash(request: Request):
+    return await _search(request)
 
 @app.get("/")
 def root():
