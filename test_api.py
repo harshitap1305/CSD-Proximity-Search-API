@@ -1,4 +1,3 @@
-"""Run: python test_api.py"""
 import functools, http.server, importlib, io, math, os, random, tempfile, threading, time
 import numpy as np, pandas as pd
 from scipy.sparse import coo_matrix
@@ -42,14 +41,13 @@ def load(mode="coords", **env):
 def queries(n, seed):
     rng = random.Random(seed)
     for t in range(n):
-        if t % 2: k = rng.randrange(N); q = (LAT[k], LON[k])        # on a location
-        else:     q = (rng.random(), rng.random())                  # off-grid
+        if t % 2: k = rng.randrange(N); q = (LAT[k], LON[k])
+        else:     q = (rng.random(), rng.random())
         yield q, rng.choice(cats), rng.choice([.08, .15, .3, .6, 1.5])
 
 TXT = make_links(.15, 1)
 FULL = make_links(0, 2)
 
-# 1. file upload, both distance modes, damaged network 
 for mode in ("coords", "hops"):
     A = load(mode); cl = TestClient(A.app); ok = 0; T = 60
     for q, cat, rad in queries(T, 11):
@@ -58,7 +56,6 @@ for mode in ("coords", "hops"):
         assert r.json()["ids"] == ref(TXT, q, cat, rad, mode == "hops"), (mode, q, cat, rad); ok += 1
     print(f"[1] upload, {mode:6s}, 15% roads missing: {ok}/{T} == scipy Dijkstra")
 
-# 2. every way of sending `link` gives the same answer
 A = load(); cl = TestClient(A.app)
 open(os.path.join(HERE, "_links_test.txt"), "w").write(TXT)
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=HERE))
@@ -79,21 +76,18 @@ for name, r in tries.items():
     print(f"[2] {name:22s} OK")
 os.remove(os.path.join(HERE, "_links_test.txt")); srv.shutdown()
 
-# 3. messy link file 
 messy = "# comment\r\n\r\n" + TXT.replace("\n", "\r\n") + "5 5\n999999 3\n1,2\n  2   1  \n3 abc\nfoo\n"
 for q, cat, rad in queries(15, 21):
     r = cl.post("/search/", data=dict(lat=q[0], long=q[1], cat=cat, rad=rad), files={"link": ("l.txt", messy)})
     assert r.json()["ids"] == ref(TXT, q, cat, rad, False)
 print("[3] CRLF, comments, blanks, commas, duplicates, self-loops, unknown IDs, junk lines: 15/15 OK")
 
-# 4. sparse / disconnected networks 
 sparse = make_links(.45, 5); good = 0; n = 0
 for q, cat, rad in queries(30, 31):
     r = cl.post("/search/", data=dict(lat=q[0], long=q[1], cat=cat, rad=rad), files={"link": ("l.txt", sparse)}).json()["ids"]
     n += 1; good += (r == ref(sparse, q, cat, rad, False))
 print(f"[4] 45% roads missing (many unreachable nodes): {good}/{n} == scipy Dijkstra"); assert good == n
 
-# 5. complete network == no-link fallback
 for q, cat, rad in queries(40, 41):
     p = dict(lat=q[0], long=q[1], cat=cat, rad=rad)
     a = cl.post("/search/", data=p, files={"link": ("l.txt", FULL)}).json()["ids"]
@@ -101,7 +95,6 @@ for q, cat, rad in queries(40, 41):
     assert a == b == ref(FULL, q, cat, rad, False), (q, cat, rad, a, b)
 print("[5] full road file == no `link` (Manhattan fallback) == Dijkstra: 40/40")
 
-# 6. errors & contract
 P = dict(lat=.5, long=.5, cat="bank", rad=.2)
 assert cl.post("/search/", data={**P, "cat": "zzz"}).status_code == 400
 assert cl.post("/search/", data={"lat": .5}).status_code == 422
@@ -112,7 +105,6 @@ assert cl.post("/search/", data={**P, "cat": "BANK"}, files={"link": ("l.txt", T
 ids = cl.post("/search/", data=P, files={"link": ("l.txt", TXT)}).json()["ids"]
 assert len(ids) == 10 == len(set(ids)) and all(CAT[i-1] == "bank" and math.hypot(LAT[i-1]-.5, LON[i-1]-.5) <= .2 + 1e-9 for i in ids)
 print("[6] error codes, case-insensitive category, 10 unique ids, category+radius constraints: OK")
-# 7. /search without slash; default links file used when `link` is omitted 
 assert cl.post("/search", data=P).status_code == 200 and cl.get("/search", params=P).status_code == 200
 dl = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False); dl.write(TXT); dl.close()
 os.environ.update(LINKS_FILE=dl.name); import app as _a; importlib.reload(_a); c3 = TestClient(_a.app)

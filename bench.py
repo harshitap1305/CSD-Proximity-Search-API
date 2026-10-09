@@ -1,4 +1,3 @@
-"""Run: python test_api.py   (references share no code with app.py)"""
 import sys, functools, http.server, importlib, io, math, os, random, tempfile, threading, time
 import numpy as np, pandas as pd
 from scipy.sparse import coo_matrix
@@ -10,7 +9,6 @@ df = pd.read_csv(os.path.join(HERE, "locations.csv")); N = len(df); S = 100
 LAT, LON, CAT, ID = df.Latitude.values, df.Longitude.values, df.Category.values, df.ID.values
 cats = sorted(set(CAT)); R = lambda x: round(float(x), 9)
 
-# ------------------------------------------------------------------ road files
 def make_links(p_missing, seed):
     rng = random.Random(seed); lines = []
     for i in range(S):
@@ -21,7 +19,6 @@ def make_links(p_missing, seed):
     rng.shuffle(lines)
     return "\n".join(lines) + "\n"
 
-# independent reference: parse text -> scipy Dijkstra -> filter -> sort
 def ref(text, q, cat, rad, hops):
     e = [tuple(map(int, l.replace(",", " ").split()[:2])) for l in text.splitlines()
          if len(l.split()) >= 2 and l.strip()[0] not in "#%"]
@@ -44,17 +41,11 @@ def load(mode="coords", **env):
 def queries(n, seed):
     rng = random.Random(seed)
     for t in range(n):
-        if t % 2: k = rng.randrange(N); q = (LAT[k], LON[k])        # on a location
-        else:     q = (rng.random(), rng.random())                  # off-grid
+        if t % 2: k = rng.randrange(N); q = (LAT[k], LON[k])
+        else:     q = (rng.random(), rng.random())
         yield q, rng.choice(cats), rng.choice([.08, .15, .3, .6, 1.5])
 
 
-# ======================================================================= bench.py
-"""Reproduces the numbers in the report.
-Usage: python bench.py validate baselines timing ties     (any subset; no args = these four)
-       python bench.py scale                              (1M-node synthetic network; ~1 GB RAM)
-       python bench.py http http://HOST:PORT              (end-to-end latency of a RUNNING server)
-"""
 import resource, statistics as st, tempfile
 os.environ.update(DIST_MODE="coords", LINKS_FILE="/nonexistent", SNAP="1")
 import app as A
@@ -70,7 +61,7 @@ def refq(G, q, cat, rad):
     eu = np.hypot(LAT - q[0], LON - q[1]); m = (CAT == cat) & (np.round(eu, 9) <= round(rad, 9)) & np.isfinite(d)
     c = np.where(m)[0]; key = sorted((R(d[k]), R(eu[k]), int(ID[k])) for k in c); return [k[2] for k in key[:10]]
 
-def point(rng, i):                                     # alternate: on a location / off-grid
+def point(rng, i):
     if i % 2: k = rng.randrange(N); return (LAT[k], LON[k])
     return (rng.random(), rng.random())
 
@@ -140,7 +131,7 @@ def scale():
 def http(url):
     import httpx
     rng = random.Random(5); body = open(os.path.join(HERE, "sample_links.txt"), "rb").read(); url = url.rstrip("/") + "/search/"
-    client = httpx.Client(timeout=60)                  # one reused connection (not a new client per request)
+    client = httpx.Client(timeout=60)
     def run(n, f):
         ts = []
         for _ in range(n):

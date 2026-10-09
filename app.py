@@ -12,17 +12,17 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 K = 10
-EPS = 9                      # decimals when comparing distances (kills float noise)
+EPS = 9
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("LOCATIONS_CSV", os.path.join(HERE, "locations.csv"))
-DEFAULT_LINKS = os.environ.get("LINKS_FILE", os.path.join(HERE, "links.txt"))
+DEFAULT_LINKS = os.environ.get("LINKS_FILE", os.path.join(HERE, "link.txt"))
 SNAP = os.environ.get("SNAP", "1") != "0"
 HOPS = os.environ.get("DIST_MODE", "coords").lower() == "hops"
 
 class Graph:
-    """Undirected road graph in CSR form (python lists -> fast scalar access)."""
     def __init__(self, indptr, indices, weights, n_edges):
         self.indptr, self.indices, self.weights, self.n_edges = indptr, indices, weights, n_edges
+
 
 class Index:
     def __init__(self, csv_path: str):
@@ -34,7 +34,7 @@ class Index:
         self.cat = df["Category"].astype(str).str.strip().str.lower().to_numpy()
         self.n = self.ids.size
 
-        order = np.argsort(self.ids, kind="stable")          # ID -> row lookup
+        order = np.argsort(self.ids, kind="stable")
         self._sorted_ids, self._sorted_rows = self.ids[order], order
 
         self.ulat, self.ulon = np.unique(self.lat), np.unique(self.lon)
@@ -42,7 +42,6 @@ class Index:
         self.lattice = bool(unique_pairs and self.ulat.size * self.ulon.size == self.n and self.ulat.size > 1)
         self.step = float(np.median(np.diff(self.ulat))) if self.ulat.size > 1 else 1.0
 
-        # per-category rows sorted by latitude -> bounding band via binary search
         self.by_cat = {}
         for c in np.unique(self.cat):
             idx = np.where(self.cat == c)[0]
@@ -51,12 +50,55 @@ class Index:
 
         self._cache: "OrderedDict[str, Graph]" = OrderedDict()
 
-    # ------------------------------------------------------------------ links
+        lon_order = np.argsort(self.lon, kind="stable")
+        self._lon_sorted_rows = lon_order
+        self._lon_sorted_vals = self.lon[lon_order]
+
     def rows_of(self, id_arr):
         pos = np.searchsorted(self._sorted_ids, id_arr)
         pos = np.clip(pos, 0, self.n - 1)
         ok = self._sorted_ids[pos] == id_arr
         return self._sorted_rows[pos], ok
+
+    def _coords_to_rows(self, lons_a, lats_a, lons_b, lats_b):
+        tol = self.step * 0.6 if self.step > 0 else 1e-5
+
+        def snap(lon_arr, lat_arr):
+            rows = np.full(len(lon_arr), -1, dtype=np.intp)
+            for i in range(len(lon_arr)):
+                lo_i = np.searchsorted(self._lon_sorted_vals, lon_arr[i] - tol, side="left")
+                hi_i = np.searchsorted(self._lon_sorted_vals, lon_arr[i] + tol, side="right")
+                cands = self._lon_sorted_rows[lo_i:hi_i]
+                if cands.size == 0:
+                    continue
+                diffs = np.abs(self.lat[cands] - lat_arr[i])
+                best = np.argmin(diffs)
+                if diffs[best] <= tol:
+                    rows[i] = cands[best]
+            return rows
+
+        ra = snap(lons_a, lats_a)
+        rb = snap(lons_b, lats_b)
+        return ra, rb, ra >= 0, rb >= 0
+
+    @staticmethod
+    def _is_coord_format(lines):
+        for line in lines:
+            p = line.strip()
+            if not p or p[0] in "#%":
+                continue
+            parts = p.replace(",", " ").split()
+            if len(parts) < 2:
+                continue
+            if len(parts) >= 4:
+                try:
+                    vals = [float(x) for x in parts[:4]]
+                    if any(v != int(v) or 0.0 < v < 1.0 for v in vals):
+                        return True
+                except ValueError:
+                    pass
+            return False
+        return False
 
     def graph_from_text(self, text: str) -> Graph:
         key = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest() + ("h" if HOPS else "c")
@@ -64,28 +106,56 @@ class Index:
         if g is not None:
             self._cache.move_to_end(key)
             return g
-        a, b = [], []
-        for line in text.splitlines():
-            p = line.replace(",", " ").split()
-            if len(p) < 2 or p[0][0] in "#%":
-                continue
-            try:
-                x, y = int(p[0]), int(p[1])
-            except ValueError:
+
+        lines = text.splitlines()
+        if self._is_coord_format(lines):
+            lons_a, lats_a, lons_b, lats_b = [], [], [], []
+            for line in lines:
+                p = line.strip()
+                if not p or p[0] in "#%":
+                    continue
+                parts = p.replace(",", " ").split()
+                if len(parts) < 4:
+                    continue
                 try:
-                    x, y = int(float(p[0])), int(float(p[1]))
+                    lons_a.append(float(parts[0]))
+                    lats_a.append(float(parts[1]))
+                    lons_b.append(float(parts[2]))
+                    lats_b.append(float(parts[3]))
                 except ValueError:
                     continue
-            a.append(x); b.append(y)
-        if not a:
-            raise ValueError("link file contains no valid 'a b' lines")
-        ra, oka = self.rows_of(np.asarray(a, np.int64))
-        rb, okb = self.rows_of(np.asarray(b, np.int64))
-        keep = oka & okb & (ra != rb)
-        ra, rb = ra[keep], rb[keep]
+            if not lons_a:
+                raise ValueError("link file contains no valid coordinate lines")
+            ra, rb, oka, okb = self._coords_to_rows(
+                np.asarray(lons_a), np.asarray(lats_a),
+                np.asarray(lons_b), np.asarray(lats_b)
+            )
+            keep = oka & okb & (ra != rb)
+            ra, rb = ra[keep], rb[keep]
+        else:
+            a, b = [], []
+            for line in lines:
+                p = line.replace(",", " ").split()
+                if len(p) < 2 or p[0][0] in "#%":
+                    continue
+                try:
+                    x, y = int(p[0]), int(p[1])
+                except ValueError:
+                    try:
+                        x, y = int(float(p[0])), int(float(p[1]))
+                    except ValueError:
+                        continue
+                a.append(x); b.append(y)
+            if not a:
+                raise ValueError("link file contains no valid 'a b' lines")
+            ra, oka = self.rows_of(np.asarray(a, np.int64))
+            rb, okb = self.rows_of(np.asarray(b, np.int64))
+            keep = oka & okb & (ra != rb)
+            ra, rb = ra[keep], rb[keep]
+
         if ra.size == 0:
-            raise ValueError("none of the links refer to known location IDs")
-        lo, hi = np.minimum(ra, rb), np.maximum(ra, rb)       # undirected, de-duplicated
+            raise ValueError("none of the links refer to known locations")
+        lo, hi = np.minimum(ra, rb), np.maximum(ra, rb)
         code = np.unique(lo.astype(np.int64) * self.n + hi)
         lo, hi = code // self.n, code % self.n
         w = np.ones(lo.size) if HOPS else np.hypot(self.lat[lo] - self.lat[hi], self.lon[lo] - self.lon[hi])
@@ -98,7 +168,6 @@ class Index:
             self._cache.popitem(last=False)
         return g
 
-    # ---------------------------------------------------------------- queries
     def _candidates(self, qlat, qlon, category, rad):
         entry = self.by_cat.get(category.strip().lower())
         if entry is None:
@@ -118,9 +187,8 @@ class Index:
             return []
         cand, euc = got
         if graph is not None:
-            src = int(np.argmin((self.lat - qlat) ** 2 + (self.lon - qlon) ** 2))   # nearest node
+            src = int(np.argmin((self.lat - qlat) ** 2 + (self.lon - qlon) ** 2))
             return self._dijkstra(graph, src, dict(zip(cand.tolist(), euc.tolist())))
-        # ---- no link file: complete lattice, grid distance = Manhattan distance
         if SNAP and self.lattice:
             sa = self.ulat[np.abs(self.ulat - qlat).argmin()]
             so = self.ulon[np.abs(self.ulon - qlon).argmin()]
@@ -132,7 +200,6 @@ class Index:
         return self.ids[cand[order]].tolist()
 
     def _dijkstra(self, g: Graph, src: int, targets: dict):
-        """Early-stopping Dijkstra. targets: row -> Euclidean distance from query."""
         indptr, indices, weights = g.indptr, g.indices, g.weights
         ids = self.ids
         dist = {src: 0.0}
@@ -144,7 +211,7 @@ class Index:
             if u in done:
                 continue
             if cutoff is not None and round(d, EPS) > cutoff:
-                break                                   # everything tied with the K-th is settled
+                break
             done.add(u)
             e = targets.get(u)
             if e is not None:
@@ -167,11 +234,10 @@ app = FastAPI(title="Nearest Locations API")
 index = Index(DATA)
 
 def _read_link(value) -> str | None:
-    """Turn whatever was sent as `link` into the text of the road file."""
     if value is None:
         return None
     if isinstance(value, UploadFile):
-        return None   # handled by caller (async read)
+        return None
     s = str(value)
     if s.strip() == "":
         return None
@@ -179,7 +245,7 @@ def _read_link(value) -> str | None:
     if t.lower().startswith(("http://", "https://")):
         with urllib.request.urlopen(t, timeout=30) as r:
             return r.read().decode("utf-8-sig", "replace")
-    if "\n" not in t and len(t) < 260:                     # maybe a file inside the app folder
+    if "\n" not in t and len(t) < 260:
         p = os.path.abspath(os.path.join(HERE, t))
         if p.startswith(HERE + os.sep) and os.path.isfile(p):
             with open(p, encoding="utf-8-sig", errors="replace") as f:
@@ -238,7 +304,6 @@ async def _search(request: Request):
 
 
 
-# ---- routes: thin wrappers so that /docs (Swagger) shows real input fields -------------
 _CATS = sorted(index.by_cat)
 _DESC = {
     "lat": "Current latitude (number)",
@@ -254,7 +319,7 @@ _POST_DOC = {"requestBody": {"required": True, "content": {"multipart/form-data"
         "cat": {"type": "string", "enum": _CATS, "description": _DESC["cat"]},
         "rad": {"type": "number", "example": 0.1, "description": _DESC["rad"]},
         "link": {"type": "string", "format": "binary",
-                 "description": "Road file (.txt), one 'a b' pair of location IDs per line. Optional."},
+                 "description": "Road file (.txt). Each line: 'Lon_A Lat_A Lon_B Lat_B' (coordinates) or 'ID_A ID_B' (integer IDs). Optional."},
     }}}}}}
 _GET_DOC = {"parameters": [
     {"name": "lat", "in": "query", "required": True, "schema": {"type": "number", "example": 0.5}, "description": _DESC["lat"]},
