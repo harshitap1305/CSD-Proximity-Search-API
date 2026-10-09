@@ -51,7 +51,7 @@ path along the roads listed in \code{link}. The two distances play different rol
 \emph{eligibility}, road distance decides \emph{rank}. The statement leaves a few details open; we fixed them as follows.
 
 \begin{description}[leftmargin=1.2cm,labelwidth=1cm,font=\bfseries]
-\item[A1] Each line \code{a b} of the link file is a road between the locations with IDs $a$ and $b$; roads are usable in both directions.
+\item[A1] Each line of the link file represents a road, formatted as either 4 coordinates (\code{Lon\_A Lat\_A Lon\_B Lat\_B}) which are snapped to nearest valid location IDs, or as 2 integer IDs (\code{a b}). Roads are usable in both directions.
 \item[A2] The length of a road is the Euclidean distance between its end points (this equals the lattice spacing $1/99$ for axis-parallel neighbours). A switch (\code{DIST\_MODE=hops}) counts every road as 1 instead.
 \item[A3] The query point is generally not a location, so travel starts at the \emph{nearest location} to it. The radius test still uses the exact query point.
 \item[A4] A shortest path may leave the search circle; only the \emph{destination} must be inside it.
@@ -146,7 +146,7 @@ Implemented in Python with FastAPI, NumPy and pandas; the CSV is loaded once at 
 \textbf{Item} & \textbf{Behaviour}\\\midrule
 Route & \code{/search/} (GET or POST); also accepts \code{/search}\\
 Fields & \code{lat}, \code{long}, \code{cat} (case-insensitive), \code{rad}, \code{link}\\
-\code{link} accepted as & uploaded file (multipart); file text in a form, JSON or query field; JSON list of \code{[a,b]} pairs; an \code{http(s)} URL; a file name inside the app folder. If omitted: \code{links.txt} if present, else a full lattice (Manhattan fallback)\\
+\code{link} accepted as & uploaded file (multipart); file text in a form, JSON or query field; JSON list of coordinate pairs or ID pairs; an \code{http(s)} URL; a file name inside the app folder. If omitted: \code{link.txt} if present, else a full lattice (Manhattan fallback)\\
 Response & \code{\{"ids": [id1, id2, ..., id10]\}}, nearest first\\
 Errors & 422 missing/non-numeric field; 400 unknown category, negative radius, empty or invalid link file\\
 Link parsing & tolerant: CRLF, blank and \code{\#} comment lines, commas, duplicate or reversed pairs, self-loops, unknown IDs and junk lines are ignored\\\bottomrule
